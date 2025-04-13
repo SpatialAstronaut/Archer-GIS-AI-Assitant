@@ -18,14 +18,19 @@ import traceback
 import io  # Import io module
 import contextlib # Import contextlib
 import re
+import subprocess # Added for calling external script
+import sys # Added for getting python executable path
+import glob # Added for finding aprx files
 from settings_manager import SettingsManager
 import tkinter.messagebox
 from langchain.agents.format_scratchpad import format_to_openai_functions
 from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
-
+from google.api_core.exceptions import ResourceExhausted # Import for retry logic
+import random # Import for retry jitter
 
 # Import tools properly
 from less_tools import *
+
 
 # Function to get all tools from the tools module
 def get_all_tools():
@@ -358,7 +363,9 @@ GIS tasks often include:
 - Always use the correct file name and extension when saving the output outside the geodatabase.
 - Verifying that any index or analysis formula (e.g., NDVI, MNDWI) is appropriate for the user's request
 - Handling cases where the file name or attribute field is unknown by using dedicated scanning or listing tools (e.g., "list_fields", "scan_workspace_directory_for_gis_files", "scan_external_directory_for_gis_files")
-
+- Verify the availability of the data in the workspace or external files usind appropriate tool before using the arcgis search tool. Some data may be locally available and some data may need to be fetched from arcgis online. 
+- Not all data is available online so IT IS CRITICAL that you check If required data already exists locally and skip searching for it on ArcGIS Online if it does.
+     
 [Critical Instruction: Do Not Assume Inputs]
 
 Attribute Fields: If a step requires an attribute field (for example, to extract "atm" values from a financial dataset) but the correct field name is not explicitly provided, do not assume it. Instead, include a step to retrieve the field names using the "list_fields" tool.
@@ -400,17 +407,27 @@ Missing Parameters: If any required parameter is unclear or missing, do not gues
    - Check if the required Landsat data is already available in the workspace or external files.
    - If the required Landsat data is not available, plan a step to download the data using the appropriate tool.
    - Landsat Images are in 16-bit when downloaded we need to rescale it to either reflectance or radiance before doing any other processing. Use appropriate rescale factor.
-3. **Plan Geoprocessing Steps:** Identify necessary steps such as:
+4. **ArcGIS Online Data:** If the user request involves ArcGIS Online data, ensure that the plan includes steps to:
+   - Verify the availability of the data in the workspace or external files usind appropriate tool before using the arcgis search tool. Some data may be locally available and some data may need to be fetched from arcgis online. 
+   - Not all data is available online so IT IS CRITICAL that you check If required data already exists locally and skip searching for it on ArcGIS Online if it does.
+   - Indicate in the description that if the data is already available in the workspace or external files, it should be used instead of searching for it on ArcGIS Online and calling the arcgis search tool can be skipped.
+   - Create the search query to find the required data. Use proper filters to narrow down the search results.
+   - Use specific keywords or phrases in the query (e.g., 'california population density').
+   - Searching using the title and snippet fields often yields the best results if described properly. So use title and snippet parameters to narrow down the search results, do not only use the query.
+   - Only use Feature Service (vector), and Image Service (raster) item types for the search.
+   - Use the url from the tool output as input to the geoprocessing tools like buffer, clip, raster calculator, etc.
+   - Add placeholder indicating a url will be passed as the input data for the geoprocessing tool so that executor knows that it needs to identify the correct dataset and pass the url here.
+5. **Plan Geoprocessing Steps:** Identify necessary steps such as:
    - Importing external files (if required) using the appropriate tool.
    - Converting file formats or reprojecting data to a common spatial reference.
    - Extracting or listing attribute fields when the required field name is unknown. In these cases, include a step that uses a tool (e.g., "list_fields") and use a clear placeholder such as "field name to be decided by executor based on list_fields output".
    - Scanning directories to determine the correct file names. Use placeholders like "file name to be decided by executor based on scan_workspace_directory_for_gis_files output" when necessary.
-4. **Tool Selection and Parameter Specification:** For each step:
+6. **Tool Selection and Parameter Specification:** For each step:
    - Choose a valid tool from the provided list.
    - Provide the required parameters exactly as specified in the tool's description.
    - Do not assume any file names or attribute names; always plan a step to verify them.
-5. **Sequence and Logic:** Ensure that the sequence of steps is logical, that each step builds on the outputs of previous steps, and that no critical dependencies are missing.
-6. **Avoid Redundancies:** If a required file or attribute is already available (from inventory or external files), do not plan unnecessary scanning or download steps unless explicitly requested.
+7. **Sequence and Logic:** Ensure that the sequence of steps is logical, that each step builds on the outputs of previous steps, and that no critical dependencies are missing.
+8. **Avoid Redundancies:** If a required file or attribute is already available (from inventory or external files), do not plan unnecessary scanning or download steps unless explicitly requested.
 
 [Output]
 Output ONLY the JSON array representing the plan. 
@@ -480,7 +497,6 @@ For each step in the plan, perform the following checks:
         "input": {{"layer": "<layer_id>"}}, 
         "description": "Retrieve field names for the layer to determine the correct field for ATM values."
      }}
-     
 4. **Logical Sequence and Completeness:**  
    - Confirm that the steps are arranged in a logical order and that dependencies (such as using output from one tool as input for a subsequent step) are properly addressed.
    - Verify that no essential step is missing to achieve the overall GIS task.
@@ -497,7 +513,21 @@ For each step in the plan, perform the following checks:
 - Ask if the field names are being assumed in the plan, if so, ask for the list of fields and their names to be added in the plan.
 - Ask if the satellite data already exists in the workspace or the external files, if so, ask for it to be used instead of downloading it again.
 - Landsat Images are in 16-bit when downloaded we need to rescale it to either reflectance or radiance before doing any other processing. Use appropriate rescale factor. Ask if images have been rescaled appropriately.
-
+- Check if the url placeholder exists in the geoprocessing tool call when we are fetching data from ArcGIS Online. If not, ask for it to be added in the plan.
+- If the user request involves ArcGIS Online data, ensure that the plan includes steps to:
+   - Verify the availability of the data in the workspace or external files using appropriate tools before using the arcgis search tool. Not all data is available online so it is crucial that you check If required data already exists locally skip searching for it on ArcGIS Online.
+   - Indicate in the description that if the data is already available in the workspace or external files, it should be used instead of searching for it on ArcGIS Online and calling the arcgis search tool can be skipped.  
+   - Create the search query to find the required data. Use proper filters to narrow down the search results.
+   - Ask if the query and filters are being used properly in the plan to search for the required data in ArcGIS Online. Question the fact whether the search query is too broad or too narrow.
+   - Searching using the title and snippet fields often yields the best results if described properly. So use title and snippet parameters to narrow down the search results.
+   - Only use Feature Service (vector), and Image Service (raster) item types for the search.
+   - Use the url from the tool output as input to the geoprocessing tools like buffer, clip, raster calculator, etc.
+   - Add placeholder indicating a url will be passed as the input data for the geoprocessing tool so that executor knows that it needs to pass a url here.
+   - Check if the executor is being indicated to choose the correct data from the output of the arcgis search tool call to solve the user request.
+   - You should use the parameters that let you filter the search results to find the required data. For example, use the title and snippet parameters to narrow down the search results, do not only use the query.
+- Ask if the plan includes the step to first check the availability of the data in the workspace or external files before using the arcgis search tool. Some data may be locally available and some data may need to be fetched from arcgis online. If required data already exists locally skip searching for it on ArcGIS Online.
+- Do not assume that the data we got from the arcgis search tool exactly matches the area for which we need the data we need. The AOI should be extracted using the clip tool.
+          
 [Output Format]
 After completing your reasoning, output a JSON object with exactly two keys:
 - "detailed_thought": A string containing your complete chain-of-thought reasoning.
@@ -537,10 +567,15 @@ You are a GIS task executor with the ability to execute multiple tools in sequen
 3. When handling field values:
    - Use exact field names as returned by list_fields tools
    - Consider the data type of the field when writing the condition for the where clause
+4. When dealing with arcgis online data: 
+   - Identify the correct dataset that is required to solve the user request and pass the url to the geoprocessing tool call.
+   - If the search result did not return a dataset that we needed, make another search call for the same data with a different query and filters to find the required data.
+   - Keep modifying the query and filters until you find the required data.
+   - If there are more than one data requirements then make sure to find the required data for each of them.
 
-4. CRITICALLY IMPORTANT: After each tool call, you MUST CONTINUE to the next step in the plan. Do not wait for confirmation to proceed.
+5. CRITICALLY IMPORTANT: After each tool call, you MUST CONTINUE to the next step in the plan. Do not wait for confirmation to proceed.
 
-5. Only after ALL steps have been executed, provide a final summary of what was accomplished.
+6. Only after ALL steps have been executed, provide a final summary of what was accomplished.
 
 Remember: Your MOST IMPORTANT directive is to KEEP MAKING TOOL CALLS until you've completed ALL steps in the plan. Never stop after just one step!
 """),
@@ -824,6 +859,14 @@ class GISAgent:
         """Force a refresh of the environment information."""
         return self.get_environment_info(force_refresh=True)
 
+    # List of tools known to create new layer outputs
+    LAYER_CREATING_TOOLS = {
+        "buffer_features", "clip_features", "dissolve_features", "merge_features",
+        "create_feature_class", "select_features", "project_features",
+        "intersect_features", "union_features", "erase_features", "spatial_join",
+        "extract_by_mask", "slope", "aspect", "hillshade", "reclassify_raster",
+        "raster_calculator", "calculate_ndvi", "calculate_savi", "calculate_tpi"
+    }
     def process_request(self, user_input: str, max_iterations: int = 5) -> str:
         """Process a user request through the three-agent pipeline."""
         try:
@@ -987,6 +1030,7 @@ class GISAgent:
 
             # Capture stdout during executor.invoke()
             captured_output = io.StringIO()
+            execution_result = None # Initialize execution_result here
             try:
                 print("\nStarting execution of all plan steps...")
                 
@@ -1043,39 +1087,72 @@ class GISAgent:
                 self.response_queue.put(archer_message)
                 
                 # Return nothing since we've already queued the message
+                # --- Add layer to project logic ---
+                if 'intermediate_steps' in execution_result:
+                    for action, observation in execution_result['intermediate_steps']:
+                        tool_name = action.tool
+                        tool_input = action.tool_input
+
+                        # Check if the tool is one that creates layers
+                        if tool_name in self.LAYER_CREATING_TOOLS:
+                            # Get the output path directly from the tool's input arguments in the plan
+                            output_path = tool_input.get("output_features") or tool_input.get("output_raster") or tool_input.get("out_raster")
+
+                            if output_path and isinstance(output_path, str):
+                                print(f"Tool '{tool_name}' completed. Checking planned output path: {output_path}")
+                                self._try_add_layer_to_project(output_path)
+                            else:
+                                print(f"Tool '{tool_name}' is a layer creator, but no 'output_features' or 'output_raster'/'out_raster' found in its planned inputs: {tool_input}")
+                # --- End add layer to project logic ---
+
+                # Return nothing since we've already queued the message
                 return ""
             except Exception as exec_error:
                 executor_output = captured_output.getvalue()
                 executor_output_cleaned = self._remove_ansi_escape_codes(executor_output)
-                
+
+                # --- Add layer to project logic (even on error, check completed steps) ---
+                # This logic remains the same as the success case, checking the planned inputs
+                # for completed steps before the error occurred.
+                if execution_result is not None and 'intermediate_steps' in execution_result: # Check added here
+                    for action, observation in execution_result['intermediate_steps']:
+                        tool_name = action.tool
+                        tool_input = action.tool_input
+
+                        if tool_name in self.LAYER_CREATING_TOOLS:
+                            output_path = tool_input.get("output_features") or tool_input.get("output_raster") or tool_input.get("out_raster")
+                            if output_path and isinstance(output_path, str):
+                                print(f"Tool '{tool_name}' completed before error. Checking planned output path: {output_path}")
+                                self._try_add_layer_to_project(output_path)
+                            else:
+                                 print(f"Tool '{tool_name}' (before error) is layer creator, but no output path found in planned inputs: {tool_input}")
+                # --- End add layer to project logic ---
+
                 # Check if we have any completed steps despite the error
                 completed_steps = []
-                if hasattr(self.executor, "_get_tool_returns") and hasattr(self.executor, "callbacks"):
-                    try:
-                        completed_steps = self.executor._get_tool_returns(self.executor.callbacks.handlers)
-                        if completed_steps:
-                            print(f"Completed {len(completed_steps)} tool calls before error")
-                    except:
-                        pass
-                
+                if execution_result is not None and 'intermediate_steps' in execution_result: # Check added here
+                    completed_steps = execution_result['intermediate_steps']
+                    if completed_steps:
+                        print(f"Completed {len(completed_steps)} tool calls before error")
+
                 print(f"Execution error: {str(exec_error)}")
                 error_message = f"Execution failed: {str(exec_error)}"
-                
+
                 # Add more details to the error message
                 error_details = f"Execution failed after completing {len(completed_steps)} steps.\nError: {str(exec_error)}"
                 traceback_str = traceback.format_exc()
-                
+
                 self.response_queue.put(f"Executor Output:\n{executor_output_cleaned}\nExecution error:\n{error_details}\n")
-                
+
                 # Create a properly formatted error message
                 error_message = f"Execution failed: {str(exec_error)}"
-                
+
                 # Ensure the error message reaches the chat tab
                 self.response_queue.put(f"Archer:\nError: {str(exec_error)}")
-                
+
                 # Return an empty string to avoid duplicating the message
                 return ""
-            
+
         except Exception as e:
             print(f"\nERROR: {str(e)}")
             print("Traceback:", traceback.format_exc())
@@ -1106,6 +1183,103 @@ class GISAgent:
             f"Directory scanning completed. Found {total_vector_files} vector files and "
             f"{total_raster_files} raster files in {len(scan_results)} directories."
         )
+
+    def _try_add_layer_to_project(self, layer_path: str):
+        """Attempts to add a newly created layer to an ArcGIS Pro project."""
+        print(f"Attempting to add layer to project: {layer_path}")
+        if not os.path.exists(layer_path):
+            print(f"Warning: Layer path '{layer_path}' does not exist. Skipping add to project.")
+            return
+
+        aprx_path = None
+        # 1. Check settings manager for explicit path
+        try:
+            aprx_path_setting = self.settings_manager.get_setting("APRX_PATH")
+            if aprx_path_setting and os.path.exists(aprx_path_setting) and aprx_path_setting.lower().endswith(".aprx"):
+                aprx_path = aprx_path_setting
+                print(f"Found APRX path in settings: {aprx_path}")
+            else:
+                 print("APRX_PATH setting not found or invalid in settings.json.")
+        except KeyError:
+             print("APRX_PATH setting not found in settings.json.")
+        except Exception as e:
+            print(f"Error reading APRX_PATH from settings: {e}")
+
+
+        # 2. If not found in settings, check workspace parent directory
+        if not aprx_path:
+            print("Attempting to find APRX near workspace GDB...")
+            try:
+                workspace = arcpy.env.workspace
+                if workspace and workspace.lower().endswith(".gdb") and os.path.exists(workspace):
+                    parent_dir = os.path.dirname(workspace)
+                    print(f"Searching for APRX files in: {parent_dir}")
+                    aprx_files = glob.glob(os.path.join(parent_dir, "*.aprx"))
+                    if aprx_files:
+                        aprx_path = aprx_files[0] # Take the first one found
+                        print(f"Found APRX file near workspace: {aprx_path}")
+                    else:
+                        print(f"No APRX files found in {parent_dir}.")
+                else:
+                    print(f"Workspace '{workspace}' is not a valid GDB path or does not exist.")
+            except Exception as e:
+                print(f"Error finding APRX near workspace: {e}")
+
+        if not aprx_path:
+            warning_msg = "Could not determine APRX path. Skipping adding layer to project."
+            print(warning_msg)
+            self.response_queue.put(f"Warning: {warning_msg}\n")
+            return
+
+        # Define map name (could be made configurable)
+        map_name = "Map"
+        add_script_path = os.path.join(os.path.dirname(__file__), "add_layer_to_project.py")
+        python_executable = sys.executable # Use the current Python executable
+
+        if not os.path.exists(add_script_path):
+             print(f"Error: Helper script 'add_layer_to_project.py' not found at {add_script_path}")
+             self.response_queue.put(f"Error: Cannot add layer to project, helper script missing.\n")
+             return
+
+        print(f"Executing script to add layer '{layer_path}' to map '{map_name}' in project '{aprx_path}'")
+        command = [
+            python_executable,
+            add_script_path,
+            aprx_path,
+            map_name,
+            layer_path
+        ]
+
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60) # Added timeout
+            log_msg = f"Add layer script execution:\n" \
+                      f"  Command: {' '.join(command)}\n" \
+                      f"  Return Code: {result.returncode}\n" \
+                      f"  STDOUT:\n{result.stdout}\n" \
+                      f"  STDERR:\n{result.stderr}\n"
+            print(log_msg)
+            self.response_queue.put(log_msg) # Send detailed log to output
+
+            if result.returncode == 0:
+                print(f"Successfully added layer '{os.path.basename(layer_path)}' to project '{os.path.basename(aprx_path)}'.")
+                # Optionally send a success message to chat?
+                # self.response_queue.put(f"Archer:\nNote: Layer '{os.path.basename(layer_path)}' added to project '{os.path.basename(aprx_path)}'. (May require project reload in Pro)\n")
+            elif result.returncode == 1:
+                 print(f"Error: Invalid arguments passed to add_layer_to_project.py.")
+            elif result.returncode == 2:
+                 print(f"Error: add_layer_to_project.py failed during processing.")
+            else:
+                 print(f"Error: add_layer_to_project.py exited with unexpected code {result.returncode}.")
+
+        except subprocess.TimeoutExpired:
+            timeout_msg = f"Error: Timeout expired while trying to add layer '{layer_path}' to project '{aprx_path}'."
+            print(timeout_msg)
+            self.response_queue.put(f"Error: {timeout_msg}\n")
+        except Exception as e:
+            error_run_msg = f"Error running add_layer_to_project.py: {e}"
+            print(error_run_msg)
+            self.response_queue.put(f"Error: {error_run_msg}\n")
+
 
 # GUI Class
 class GISGUI:
